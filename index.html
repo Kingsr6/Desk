@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Desk: live signals</title>
+<style>
+:root{--bg:#eef0ec;--panel:#fbfbf8;--ink:#17201f;--mute:#667370;--line:#d3d8d2;--up:#0f8f7e;--dn:#c8503c;--amber:#b87a0a}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1517;--panel:#162023;--ink:#e6ece9;--mute:#8a9b97;--line:#27363a;--up:#3ccfb7;--dn:#f0715a;--amber:#f0b24a}}
+*{box-sizing:border-box}
+body{margin:0;padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0);background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,sans-serif}
+header{padding:14px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+h1{margin:0;font-size:18px}
+.sub{color:var(--mute);font-size:12.5px}
+#st{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12.5px}
+#dot{width:9px;height:9px;border-radius:50%;background:var(--dn)}
+#dot.on{background:var(--up)}
+main{padding:12px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:480px}
+th,td{padding:6px;text-align:right;font-size:13px;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mute);font-weight:500}
+td.h{width:16%;border:2px solid var(--panel);border-radius:6px;text-align:center;font-variant-numeric:tabular-nums}
+.mono{font-variant-numeric:tabular-nums}
+.stale{opacity:.45}
+.up{color:var(--up)}.dn{color:var(--dn)}
+p.note{margin:12px 2px;color:var(--mute);font-size:12.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Desk: live signals</h1>
+  <span class="sub">Milestone 1. Market data only, no orders.</span>
+  <div id="st"><i id="dot"></i><span id="stt">Connecting</span></div>
+</header>
+<main>
+  <section><table id="t"><tr><td class="sub">Waiting for data…</td></tr></table></section>
+  <p class="note">Signals run from -1 to +1. Composite weights: momentum 40%, volume 25%, book 35%. Volatility is shown for context and is not part of the composite. Candle counts below 60 mean signals are still warming up.</p>
+</main>
+<script>
+const fmt=(x)=>x>=1000?x.toLocaleString('en-US',{maximumFractionDigits:2}):x.toFixed(x>=1?3:5);
+const cell=(v)=>{const c=v>=0?'var(--up)':'var(--dn)';return `<td class="h" style="background:color-mix(in srgb,${c} ${Math.round(Math.abs(v)*70)+4}%,transparent)">${v>=0?'+':''}${v.toFixed(2)}</td>`};
+const q=location.search;
+const proto=location.protocol==='https:'?'wss':'ws';
+let retry=0;
+function connect(){
+  const ws=new WebSocket(`${proto}://${location.host}/ws${q}`);
+  ws.onopen=()=>{retry=0};
+  ws.onmessage=(e)=>{
+    const m=JSON.parse(e.data);if(m.type!=='snapshot')return;
+    document.getElementById('dot').className=m.connected?'on':'';
+    document.getElementById('stt').textContent=m.connected?'Exchange feed live':'Exchange feed down';
+    document.getElementById('t').innerHTML='<tr><th>Symbol</th><th>Price</th><th>Mom</th><th>Vol</th><th>Vlty</th><th>Book</th><th>Composite</th><th>Candles</th></tr>'+
+      m.symbols.map(s=>`<tr class="${s.stale?'stale':''}"><td><b>${s.symbol}</b></td><td class="mono">${s.price?fmt(s.price):'-'}</td>${cell(s.signals.momentum)}${cell(s.signals.volume)}${cell(s.signals.volatility)}${cell(s.signals.book)}${cell(s.composite)}<td class="mono sub">${s.candles}</td></tr>`).join('');
+  };
+  ws.onclose=()=>{document.getElementById('dot').className='';document.getElementById('stt').textContent='Reconnecting';setTimeout(connect,Math.min(10000,500*2**retry++))};
+}
+connect();
+</script>
+</body>
+</html>
