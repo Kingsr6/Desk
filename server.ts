@@ -1,9 +1,11 @@
-// Desk milestone 1: live Binance market data -> signals -> WebSocket UI. No orders are placed.
+// Desk milestone 2: live data -> signals -> Watcher -> Analyst (rules stand-in) -> Risk -> event store.
+// No orders are placed. Approved plans are only recorded.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
+import pg from 'pg';
 
 // ---------- types ----------
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -214,22 +216,139 @@ class MarketFeed extends EventEmitter {
   }
 }
 
-// ---------- server ----------
+// ---------- pipeline types ----------
+interface TradePlan {
+  planId: string; symbol: string; action: 'long' | 'short';
+  entry: number; stop: number; target: number; confidence: number;
+  thesis: string; invalidation: string; analyst: string;
+  evidence: { signal: string; value: number; note: string }[];
+}
+interface RiskDecision { approved: boolean; qty: number; notional: number; reasons: string[] }
+interface Decision { ts: number; plan: TradePlan; risk: RiskDecision }
 
+// ---------- config ----------
 const PORT = Number(process.env.PORT ?? 3000);
 const TOKEN = process.env.AUTH_TOKEN ?? '';
 const SYMBOLS = (process.env.SYMBOLS ?? 'BTCUSDT,ETHUSDT,SOLUSDT').split(',').map((s) => s.trim().toUpperCase());
+const EQUITY = Number(process.env.PAPER_EQUITY ?? 10000);
+const THRESHOLD = 0.28;
+const COOLDOWN_MS = 5 * 60_000;
+const RISK_PER_TRADE = 0.005;     // 0.5% of equity at stake per plan
+const MAX_NOTIONAL = 0.25;        // 25% of equity
+const MAX_APPROVALS_PER_HOUR = 3; // stand-in for "max open positions" until the executor exists
 
+// ---------- event store (Postgres, optional) ----------
+const pool = process.env.DATABASE_URL ? new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 3 }) : null;
+let dbOk = false;
+async function dbInit() {
+  if (!pool) return console.warn('DATABASE_URL not set: events are kept in memory only');
+  try {
+    await pool.query(`create table if not exists events (
+      id bigserial primary key, ts timestamptz not null default now(),
+      type text not null, payload jsonb not null)`);
+    dbOk = true;
+    console.log('event store ready');
+  } catch (e) {
+    console.error('db init failed:', (e as Error).message);
+  }
+}
+function record(type: string, payload: unknown) {
+  if (pool && dbOk) {
+    pool.query('insert into events (type, payload) values ($1, $2)', [type, JSON.stringify(payload)])
+      .catch((e) => console.error('event insert failed:', e.message));
+  }
+}
+
+// ---------- watcher, analyst (rules), risk ----------
+let killSwitch = false;
+const cooldown = new Map<string, number>();
+const approvals: number[] = [];
+const decisions: Decision[] = [];
+
+function analyst(symbol: string, price: number, s: Signals, comp: number, candles: Candle[]): TradePlan {
+  const dir = comp > 0 ? 1 : -1;
+  const sigma = sd(logReturns(candles.slice(-60).map((c) => c.c)));
+  const stopPct = clamp(sigma * Math.sqrt(10) * 2, 0.005, 0.08);
+  const entry = price;
+  const stop = entry * (1 - dir * stopPct);
+  const target = entry * (1 + dir * stopPct * 2);
+  const side = dir > 0 ? 'long' : 'short';
+  return {
+    planId: `${symbol}-${Date.now()}`, symbol, action: side, entry, stop, target,
+    confidence: Math.min(0.9, 0.5 + Math.abs(comp) * 0.5),
+    thesis: `${side === 'long' ? 'Upside' : 'Downside'} momentum with ${s.volume * dir > 0 ? 'supporting' : 'weak'} volume and ${s.book * dir > 0 ? 'supportive' : 'unsupportive'} order book. Reward to risk 2:1.`,
+    invalidation: `Price ${dir > 0 ? 'falls to' : 'rises to'} ${stop.toFixed(4)}`,
+    analyst: 'rules-v0 (Claude arrives in milestone 3)',
+    evidence: [
+      { signal: 'momentum', value: s.momentum, note: 'return over 15 candles vs recent volatility' },
+      { signal: 'volume', value: s.volume, note: 'recent volume vs baseline, signed by candle direction' },
+      { signal: 'book', value: s.book, note: 'bid minus ask depth within 0.5% of mid' },
+      { signal: 'volatility', value: s.volatility, note: `sets the stop at ${(stopPct * 100).toFixed(2)}% of price` },
+      { signal: 'composite', value: comp, note: `confidence ${(Math.min(0.9, 0.5 + Math.abs(comp) * 0.5) * 100).toFixed(0)}%` },
+    ],
+  };
+}
+
+function risk(plan: TradePlan, st: SymbolState): RiskDecision {
+  const veto: string[] = [];
+  const notes: string[] = [];
+  if (killSwitch) veto.push('kill switch is on');
+  if (!st.price || Math.abs(st.price - plan.entry) / plan.entry > 0.003) veto.push('plan price is stale (moved over 0.3%)');
+  const dist = Math.abs(plan.entry - plan.stop);
+  const stopPct = dist / plan.entry;
+  if (stopPct < 0.005 || stopPct > 0.08) veto.push('stop distance outside 0.5% to 8%');
+  if (Math.abs(plan.target - plan.entry) / dist < 1.5) veto.push('reward to risk below 1.5');
+  const bb = st.book.bids[0], ba = st.book.asks[0];
+  if (!bb || !ba) veto.push('order book empty');
+  else if ((ba[0] - bb[0]) / ((ba[0] + bb[0]) / 2) > 0.001) veto.push('spread wider than 0.1%');
+  const hourAgo = Date.now() - 3_600_000;
+  while (approvals.length && (approvals[0] as number) < hourAgo) approvals.shift();
+  if (approvals.length >= MAX_APPROVALS_PER_HOUR) veto.push('max 3 approvals per hour reached');
+  let qty = (EQUITY * RISK_PER_TRADE) / dist;
+  let notional = qty * plan.entry;
+  if (notional > EQUITY * MAX_NOTIONAL) {
+    qty = (EQUITY * MAX_NOTIONAL) / plan.entry;
+    notional = qty * plan.entry;
+    notes.push('resized to the 25% notional cap');
+  }
+  if (veto.length) return { approved: false, qty: 0, notional: 0, reasons: veto };
+  approvals.push(Date.now());
+  return { approved: true, qty, notional, reasons: ['all checks passed', `0.5% of equity at stake (${(EQUITY * RISK_PER_TRADE).toFixed(2)} USDT)`, ...notes] };
+}
+
+function watch() {
+  if (killSwitch) return;
+  const now = Date.now();
+  for (const symbol of SYMBOLS) {
+    const st = feed.state.get(symbol)!;
+    if (!feed.connected || st.candles.length < 60 || now - st.lastTradeAt > 15_000) continue;
+    if ((cooldown.get(symbol) ?? 0) > now) continue;
+    const sig = computeSignals(st.candles, st.book);
+    const comp = composite(sig);
+    if (Math.abs(comp) < THRESHOLD) continue;
+    cooldown.set(symbol, now + COOLDOWN_MS);
+    record('candidate', { symbol, composite: comp, signals: sig });
+    const plan = analyst(symbol, st.price, sig, comp, st.candles);
+    record('plan', plan);
+    const rd = risk(plan, st);
+    record('risk_decision', { planId: plan.planId, ...rd });
+    decisions.unshift({ ts: now, plan, risk: rd });
+    if (decisions.length > 30) decisions.pop();
+    console.log(`${symbol} ${plan.action} -> ${rd.approved ? 'APPROVED' : 'VETOED: ' + rd.reasons.join('; ')}`);
+  }
+}
+setInterval(watch, 1000);
+
+// ---------- server ----------
 const feed = new MarketFeed(SYMBOLS);
 const indexPath = fileURLToPath(new URL('./index.html', import.meta.url));
-
 const authed = (url: URL) => !TOKEN || url.searchParams.get('token') === TOKEN;
 
 const http = createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    return void res.end(JSON.stringify({ ok: true, feed: feed.connected }));
+    return void res.end(JSON.stringify({ ok: true, feed: feed.connected, db: dbOk }));
   }
   if (!authed(url)) {
     res.writeHead(401);
@@ -253,22 +372,30 @@ http.on('upgrade', (req, socket, head) => {
   }
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws));
 });
+wss.on('connection', (ws: WebSocket) => {
+  ws.on('message', (raw) => {
+    try {
+      const m = JSON.parse(raw.toString());
+      if (m.type === 'kill' || m.type === 'resume') {
+        killSwitch = m.type === 'kill';
+        record('kill_switch', { on: killSwitch });
+        console.log(`kill switch ${killSwitch ? 'ON' : 'off'}`);
+      }
+    } catch { /* ignore */ }
+  });
+});
 
-function snapshot(): Snapshot {
+function snapshot() {
   const now = Date.now();
   const symbols: SymbolSnapshot[] = SYMBOLS.map((symbol) => {
     const st = feed.state.get(symbol)!;
     const signals = computeSignals(st.candles, st.book);
     return {
-      symbol,
-      price: st.price,
-      signals,
-      composite: composite(signals),
-      candles: st.candles.length,
-      stale: !feed.connected || now - st.lastTradeAt > 15_000,
+      symbol, price: st.price, signals, composite: composite(signals),
+      candles: st.candles.length, stale: !feed.connected || now - st.lastTradeAt > 15_000,
     };
   });
-  return { type: 'snapshot', ts: now, connected: feed.connected, symbols };
+  return { type: 'snapshot', ts: now, connected: feed.connected, symbols, killSwitch, db: dbOk, equity: EQUITY, decisions: decisions.slice(0, 15) };
 }
 
 setInterval(() => {
@@ -277,6 +404,7 @@ setInterval(() => {
   for (const c of wss.clients) if (c.readyState === WebSocket.OPEN) c.send(msg);
 }, 500);
 
+await dbInit();
 await feed.start();
-http.listen(PORT, () => console.log(`desk on http://localhost:${PORT}${TOKEN ? '/?token=...' : ''}`));
+http.listen(PORT, () => console.log(`desk on port ${PORT}`));
 process.on('SIGINT', () => { feed.stop(); process.exit(0); });

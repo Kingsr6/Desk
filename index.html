@@ -3,58 +3,82 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Desk: live signals</title>
+<title>Desk: Watcher and Risk</title>
 <style>
 :root{--bg:#eef0ec;--panel:#fbfbf8;--ink:#17201f;--mute:#667370;--line:#d3d8d2;--up:#0f8f7e;--dn:#c8503c;--amber:#b87a0a}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1517;--panel:#162023;--ink:#e6ece9;--mute:#8a9b97;--line:#27363a;--up:#3ccfb7;--dn:#f0715a;--amber:#f0b24a}}
 *{box-sizing:border-box}
 body{margin:0;padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,0);background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,sans-serif}
 header{padding:14px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-h1{margin:0;font-size:18px}
+h1{margin:0;font-size:18px}h2{margin:0 0 8px;font-size:14px}
 .sub{color:var(--mute);font-size:12.5px}
-#st{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:12.5px}
-#dot{width:9px;height:9px;border-radius:50%;background:var(--dn)}
-#dot.on{background:var(--up)}
-main{padding:12px}
+.badges{display:flex;gap:12px;flex-wrap:wrap;margin-left:auto;font-size:12.5px}
+.b{display:flex;align-items:center;gap:6px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--dn)}.dot.on{background:var(--up)}
+main{padding:12px;display:grid;gap:12px}
 section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;overflow-x:auto}
 table{border-collapse:collapse;width:100%;min-width:480px}
 th,td{padding:6px;text-align:right;font-size:13px;white-space:nowrap}
-th:first-child,td:first-child{text-align:left}
-th{color:var(--mute);font-weight:500}
+th:first-child,td:first-child{text-align:left}th{color:var(--mute);font-weight:500}
 td.h{width:16%;border:2px solid var(--panel);border-radius:6px;text-align:center;font-variant-numeric:tabular-nums}
-.mono{font-variant-numeric:tabular-nums}
-.stale{opacity:.45}
-.up{color:var(--up)}.dn{color:var(--dn)}
-p.note{margin:12px 2px;color:var(--mute);font-size:12.5px}
+.mono{font-variant-numeric:tabular-nums}.stale{opacity:.45}
+button{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:7px 12px;cursor:pointer}
+button.kill{background:var(--dn);border-color:var(--dn);color:#2a0c06}
+button.resume{background:var(--up);border-color:var(--up);color:#06231e}
+details{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:6px}
+summary{cursor:pointer;display:flex;gap:8px;flex-wrap:wrap;align-items:baseline}
+.pill{font-size:11.5px;border:1px solid var(--line);border-radius:99px;padding:0 8px}
+.ok{color:var(--up);border-color:var(--up)}.no{color:var(--dn);border-color:var(--dn)}
+ul{margin:8px 0 0;padding-left:18px;color:var(--mute);font-size:12.5px}
+p.note{margin:0;color:var(--mute);font-size:12.5px}
 </style>
 </head>
 <body>
 <header>
-  <h1>Desk: live signals</h1>
-  <span class="sub">Milestone 1. Market data only, no orders.</span>
-  <div id="st"><i id="dot"></i><span id="stt">Connecting</span></div>
+  <h1>Desk: Watcher and Risk</h1>
+  <div class="badges">
+    <span class="b"><i class="dot" id="d1"></i><span id="t1">Feed</span></span>
+    <span class="b"><i class="dot" id="d2"></i><span id="t2">Event store</span></span>
+    <button id="kb" class="kill">Kill switch</button>
+  </div>
 </header>
 <main>
-  <section><table id="t"><tr><td class="sub">Waiting for data…</td></tr></table></section>
-  <p class="note">Signals run from -1 to +1. Composite weights: momentum 40%, volume 25%, book 35%. Volatility is shown for context and is not part of the composite. Candle counts below 60 mean signals are still warming up.</p>
+  <section><h2>Signals</h2><table id="t"><tr><td class="sub">Waiting for data…</td></tr></table></section>
+  <section>
+    <h2>Plans and risk decisions</h2>
+    <div id="dec"><p class="note">Nothing yet. The Watcher flags a symbol when its composite score passes 0.28 either way, so this can take a while in quiet markets.</p></div>
+  </section>
+  <p class="note">Paper only. No orders are placed. The Analyst is a rule-based stand-in until Claude is wired in at milestone 3. Approved plans are recorded, not executed.</p>
 </main>
 <script>
-const fmt=(x)=>x>=1000?x.toLocaleString('en-US',{maximumFractionDigits:2}):x.toFixed(x>=1?3:5);
-const cell=(v)=>{const c=v>=0?'var(--up)':'var(--dn)';return `<td class="h" style="background:color-mix(in srgb,${c} ${Math.round(Math.abs(v)*70)+4}%,transparent)">${v>=0?'+':''}${v.toFixed(2)}</td>`};
-const q=location.search;
-const proto=location.protocol==='https:'?'wss':'ws';
-let retry=0;
+const fmt=x=>x>=1000?x.toLocaleString('en-US',{maximumFractionDigits:2}):x.toFixed(x>=1?3:5);
+const cell=v=>{const c=v>=0?'var(--up)':'var(--dn)';return `<td class="h" style="background:color-mix(in srgb,${c} ${Math.round(Math.abs(v)*70)+4}%,transparent)">${v>=0?'+':''}${v.toFixed(2)}</td>`};
+const $=id=>document.getElementById(id);
+let ws,retry=0,kill=false;
+function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))}
+$('kb').onclick=()=>send({type:kill?'resume':'kill'});
 function connect(){
-  const ws=new WebSocket(`${proto}://${location.host}/ws${q}`);
+  ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws${location.search}`);
   ws.onopen=()=>{retry=0};
-  ws.onmessage=(e)=>{
+  ws.onmessage=e=>{
     const m=JSON.parse(e.data);if(m.type!=='snapshot')return;
-    document.getElementById('dot').className=m.connected?'on':'';
-    document.getElementById('stt').textContent=m.connected?'Exchange feed live':'Exchange feed down';
-    document.getElementById('t').innerHTML='<tr><th>Symbol</th><th>Price</th><th>Mom</th><th>Vol</th><th>Vlty</th><th>Book</th><th>Composite</th><th>Candles</th></tr>'+
-      m.symbols.map(s=>`<tr class="${s.stale?'stale':''}"><td><b>${s.symbol}</b></td><td class="mono">${s.price?fmt(s.price):'-'}</td>${cell(s.signals.momentum)}${cell(s.signals.volume)}${cell(s.signals.volatility)}${cell(s.signals.book)}${cell(s.composite)}<td class="mono sub">${s.candles}</td></tr>`).join('');
+    kill=m.killSwitch;
+    $('d1').className='dot'+(m.connected?' on':'');$('t1').textContent=m.connected?'Feed live':'Feed down';
+    $('d2').className='dot'+(m.db?' on':'');$('t2').textContent=m.db?'Event store on':'Memory only';
+    $('kb').textContent=kill?'Resume (kill switch ON)':'Kill switch';$('kb').className=kill?'resume':'kill';
+    $('t').innerHTML='<tr><th>Symbol</th><th>Price</th><th>Mom</th><th>Vol</th><th>Vlty</th><th>Book</th><th>Composite</th></tr>'+
+      m.symbols.map(s=>`<tr class="${s.stale?'stale':''}"><td><b>${s.symbol}</b></td><td class="mono">${s.price?fmt(s.price):'-'}</td>${cell(s.signals.momentum)}${cell(s.signals.volume)}${cell(s.signals.volatility)}${cell(s.signals.book)}${cell(s.composite)}</tr>`).join('');
+    if(m.decisions.length)$('dec').innerHTML=m.decisions.map(d=>{
+      const p=d.plan,r=d.risk,t=new Date(d.ts).toLocaleTimeString('en-GB');
+      return `<details><summary><b>${p.symbol} ${p.action.toUpperCase()}</b><span class="pill ${r.approved?'ok':'no'}">${r.approved?'approved':'vetoed'}</span><span class="sub mono">${t} · conf ${Math.round(p.confidence*100)}%</span></summary>
+      <ul><li><b>Plan:</b> ${p.thesis}</li>
+      <li class="mono">Entry ${fmt(p.entry)}, stop ${fmt(p.stop)}, target ${fmt(p.target)}</li>
+      ${r.approved?`<li class="mono">Size ${r.qty.toFixed(r.qty<10?4:1)} units, notional ${r.notional.toFixed(2)} USDT</li>`:''}
+      <li><b>Risk:</b> ${r.reasons.join('; ')}</li>
+      ${p.evidence.map(x=>`<li class="mono">${x.signal} ${x.value>=0?'+':''}${x.value.toFixed(2)}: ${x.note}</li>`).join('')}
+      <li>${p.invalidation}. Analyst: ${p.analyst}</li></ul></details>`}).join('');
   };
-  ws.onclose=()=>{document.getElementById('dot').className='';document.getElementById('stt').textContent='Reconnecting';setTimeout(connect,Math.min(10000,500*2**retry++))};
+  ws.onclose=()=>{$('d1').className='dot';$('t1').textContent='Reconnecting';setTimeout(connect,Math.min(10000,500*2**retry++))};
 }
 connect();
 </script>
