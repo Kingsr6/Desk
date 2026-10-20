@@ -22,7 +22,6 @@ interface SymbolSnapshot {
   candles: number;
   stale: boolean;
 }
-interface Snapshot { type: 'snapshot'; ts: number; connected: boolean; symbols: SymbolSnapshot[] }
 
 // ---------- signals ----------
 
