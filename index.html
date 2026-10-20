@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Desk: Claude analyst</title>
+<title>Desk: majors and radar</title>
 <style>
 :root{--bg:#eef0ec;--panel:#fbfbf8;--ink:#17201f;--mute:#667370;--line:#d3d8d2;--up:#0f8f7e;--dn:#c8503c;--amber:#b87a0a}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1517;--panel:#162023;--ink:#e6ece9;--mute:#8a9b97;--line:#27363a;--up:#3ccfb7;--dn:#f0715a;--amber:#f0b24a}}
@@ -35,10 +35,11 @@ p.note{margin:0;color:var(--mute);font-size:12.5px}
 </head>
 <body>
 <header>
-  <h1>Desk: Claude analyst</h1>
+  <h1>Desk: majors and radar</h1>
   <div class="badges">
     <span class="b"><i class="dot" id="d1"></i><span id="t1">Feed</span></span>
     <span class="b"><i class="dot" id="d2"></i><span id="t2">Event store</span></span>
+    <span class="b"><i class="dot" id="d4"></i><span id="t4">Radar</span></span>
     <span class="b"><i class="dot" id="d3"></i><span id="t3">Analyst</span></span>
     <button id="kb" class="kill">Kill switch</button>
   </div>
@@ -48,6 +49,15 @@ p.note{margin:0;color:var(--mute);font-size:12.5px}
   <section>
     <h2>Plans and risk decisions</h2>
     <div id="dec"><p class="note">Nothing yet. The Watcher flags a symbol when its composite score passes 0.28 either way, so this can take a while in quiet markets.</p></div>
+  </section>
+  <section>
+    <h2>Degen radar <span class="sub">(paper only, fake money)</span></h2>
+    <p class="note" id="rs">Waiting…</p>
+    <h2 style="margin-top:12px">Open paper positions</h2><div id="ro"></div>
+    <h2 style="margin-top:12px">Closed trades</h2><div id="rc"></div>
+    <h2 style="margin-top:12px">Best candidates now</h2><div id="rw"></div>
+    <h2 style="margin-top:12px">Why tokens were filtered out</h2><div id="rr"></div>
+    <p class="note" style="margin-top:12px">Costs are modelled: 1% fee per side, price impact from pool size and a small network fee. Real results are worse: bots front-run you, transactions fail, and DexScreener cannot see holder concentration or mint authority. A paper profit here is not evidence of a real one.</p>
   </section>
   <p class="note" id="err" style="color:var(--amber)"></p>
   <p class="note">Paper only. No orders are placed. Claude writes each plan and can answer no trade; code makes every risk decision. Approved plans are recorded, not executed.</p>
@@ -59,12 +69,26 @@ const $=id=>document.getElementById(id);
 let ws,retry=0,kill=false;
 function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))}
 $('kb').onclick=()=>send({type:kill?'resume':'kill'});
+
+const usd=x=>(x<0?'-':'')+'$'+Math.abs(x).toFixed(2);
+const pc=x=>(x>=0?'+':'')+(x*100).toFixed(0)+'%';
+function tbl(head,rows){return rows.length?`<div style="overflow-x:auto"><table style="min-width:380px"><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr>${rows.map(r=>`<tr>${r.map(c=>`<td>${c}</td>`).join('')}</tr>`).join('')}</table></div>`:'<p class="note">None yet.</p>'}
+function renderRadar(r){
+  $('d4').className='dot'+(r.apiOk?' on':'');$('t4').textContent=r.apiOk?'Radar live':'Radar waiting';
+  const pnl=r.equity-r.start;
+  $('rs').innerHTML=`Paper equity <b class="mono">${usd(r.equity)}</b> from ${usd(r.start)} (${pc(pnl/r.start)}) · cash ${usd(r.cash)} · tracking ${r.tracked} tokens on ${r.cfg.chains.join(', ')}<br>${r.trades} closed, ${r.trades?Math.round(r.wins/r.trades*100):0}% wins, average ${pc(r.avgPct)} per trade, max drawdown ${Math.round(r.maxDD*100)}%${r.paused?' · <b style="color:var(--amber)">paused by kill switch</b>':''}${r.error?`<br><span style="color:var(--amber)">Last issue: ${r.error}</span>`:''}`;
+  $('ro').innerHTML=tbl(['Token','Cost','Value','P&L','Held'],r.open.map(p=>[`<b>${p.symbol}</b>`,usd(p.cost),usd(p.value),`<span class="${p.pnlPct>=0?'up':'dn'}">${pc(p.pnlPct)}</span>`,Math.round(p.heldMin)+'m']));
+  $('rc').innerHTML=tbl(['Token','Exit reason','P&L','Held'],r.closed.map(c=>[`<b>${c.symbol}</b>`,c.reason,`<span class="${c.pnl>=0?'up':'dn'}">${pc(c.pnlPct)}</span>`,Math.round(c.heldMin)+'m']));
+  $('rw').innerHTML=tbl(['Token','Score','Liquidity','5m','1h','Age'],r.watch.map(w=>[`<b>${w.symbol}</b>${w.traded?' ✓':''}`,w.score.toFixed(2),'$'+Math.round(w.liq).toLocaleString('en-US'),w.m5+'%',w.h1+'%',Math.round(w.ageMin)+'m']));
+  const rej=Object.entries(r.rejects).sort((a,b)=>b[1]-a[1]);
+  $('rr').innerHTML=tbl(['Reason','Tokens'],rej.map(([k,v])=>[k,v]));
+}
 function connect(){
   ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws${location.search}`);
   ws.onopen=()=>{retry=0};
   ws.onmessage=e=>{
     const m=JSON.parse(e.data);if(m.type!=='snapshot')return;
-    kill=m.killSwitch;
+    kill=m.killSwitch;if(m.radar)renderRadar(m.radar);
     $('d1').className='dot'+(m.connected?' on':'');$('t1').textContent=m.connected?'Feed live':'Feed down';
     $('d2').className='dot'+(m.db?' on':'');$('t2').textContent=m.db?'Event store on':'Memory only';
     $('d3').className='dot'+(m.analyst==='claude'?' on':'');$('t3').textContent=m.analyst==='claude'?'Claude analyst':'Rules analyst (no API key)';$('err').textContent=m.analystError?('Analyst issue: '+m.analystError):'';

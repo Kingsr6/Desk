@@ -1,4 +1,4 @@
-// Desk milestone 3: live data -> signals -> Watcher -> Analyst (Claude) -> Risk -> event store.
+// Desk milestone 3 + degen radar (paper only): live data -> signals -> Watcher -> Analyst (Claude) -> Risk -> event store.
 // No orders are placed. Approved plans are only recorded.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
 import pg from 'pg';
+import { Radar } from './radar.js';
 
 // ---------- types ----------
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -259,6 +260,9 @@ function record(type: string, payload: unknown) {
   }
 }
 
+const radar = new Radar(record);
+if (process.env.RADAR_ENABLED !== 'false') radar.start();
+
 // ---------- watcher, analyst (rules), risk ----------
 let killSwitch = false;
 const cooldown = new Map<string, number>();
@@ -495,6 +499,7 @@ wss.on('connection', (ws: WebSocket) => {
       const m = JSON.parse(raw.toString());
       if (m.type === 'kill' || m.type === 'resume') {
         killSwitch = m.type === 'kill';
+        radar.paused = killSwitch;
         record('kill_switch', { on: killSwitch });
         console.log(`kill switch ${killSwitch ? 'ON' : 'off'}`);
       }
@@ -512,7 +517,7 @@ function snapshot() {
       candles: st.candles.length, stale: !feed.connected || now - st.lastTradeAt > 15_000,
     };
   });
-  return { type: 'snapshot', ts: now, connected: feed.connected, symbols, killSwitch, db: dbOk, equity: EQUITY, analyst: API_KEY ? 'claude' : 'rules', analystError, decisions: decisions.slice(0, 15) };
+  return { type: 'snapshot', ts: now, connected: feed.connected, symbols, killSwitch, db: dbOk, equity: EQUITY, analyst: API_KEY ? 'claude' : 'rules', analystError, radar: radar.snapshot(), decisions: decisions.slice(0, 15) };
 }
 
 setInterval(() => {
