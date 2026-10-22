@@ -87,13 +87,15 @@ export class Radar {
   private tick = 0;
   private seq = 0;
   private lastError = '';
+  private backoff = 0;
+  private rot = 0;
 
   constructor(private record: (type: string, payload: unknown) => void) {}
 
   start() {
     const loop = async () => {
       try { await this.cycle(); } catch (e) { this.lastError = (e as Error).message; console.error('radar:', this.lastError); }
-      setTimeout(loop, 10_000);
+      setTimeout(loop, 15_000);
     };
     void loop();
   }
@@ -101,7 +103,7 @@ export class Radar {
   async cycle() {
     if (Date.now() < this.pausedUntil) return;
     this.tick++;
-    if (this.tick % 2 === 1) await this.discover();
+    if (this.tick % 4 === 1) await this.discover();
     await this.refresh();
     this.manage();
     this.scan();
@@ -110,8 +112,15 @@ export class Radar {
 
   private async get(path: string): Promise<any> {
     const r = await fetch(API + path, { signal: AbortSignal.timeout(10_000), headers: { accept: 'application/json' } });
-    if (r.status === 429) { this.pausedUntil = Date.now() + 30_000; this.apiOk = false; throw new Error('rate limited, pausing 30s'); }
+    if (r.status === 429) {
+      this.backoff = Math.min(300_000, this.backoff ? this.backoff * 2 : 30_000);
+      this.pausedUntil = Date.now() + this.backoff;
+      this.apiOk = false;
+      throw new Error(`rate limited, pausing ${Math.round(this.backoff / 1000)}s`);
+    }
     if (!r.ok) { this.apiOk = false; throw new Error(`DexScreener HTTP ${r.status}`); }
+    this.backoff = 0;
+    this.lastError = '';
     this.apiOk = true;
     return r.json();
   }
@@ -138,8 +147,18 @@ export class Radar {
   private async refresh() {
     const byAddr = new Map<string, Tok>();
     for (const t of this.toks.values()) byAddr.set(t.address, t);
-    const addrs = [...byAddr.keys()];
+    // Open positions first, then a rotating slice of the rest (4 requests per cycle keeps us well under the limits).
+    const held = new Set(this.open.map((p) => p.key));
+    const all = [...byAddr.values()];
+    const pri = all.filter((t) => held.has(t.key)).map((t) => t.address);
+    const rest = all.filter((t) => !held.has(t.key)).map((t) => t.address);
+    const slots = Math.max(0, 120 - pri.length);
+    const pick: string[] = [];
+    for (let i = 0; i < Math.min(slots, rest.length); i++) pick.push(rest[(this.rot + i) % rest.length]!);
+    this.rot = rest.length ? (this.rot + slots) % rest.length : 0;
+    const addrs = [...pri, ...pick];
     for (let i = 0; i < addrs.length; i += 30) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 400));
       const data = await this.get(`/latest/dex/tokens/${addrs.slice(i, i + 30).join(',')}`);
       const best = new Map<string, Pair>();
       for (const p of (data?.pairs ?? []) as Pair[]) {
@@ -152,7 +171,7 @@ export class Radar {
       for (const [a, p] of best) { const t = byAddr.get(a)!; t.pair = p; t.lastSeen = Date.now(); }
     }
     // free slots held by tokens that aged out (never drop open positions)
-    const now = Date.now(), held = new Set(this.open.map((p) => p.key));
+    const now = Date.now();
     for (const t of this.toks.values()) {
       const age = t.pair?.pairCreatedAt ? (now - t.pair.pairCreatedAt) / 3_600_000 : 0;
       if (!held.has(t.key) && age > CFG.maxAgeHours * 2) this.toks.delete(t.key);
@@ -165,7 +184,7 @@ export class Radar {
     const now = Date.now();
     for (const pos of [...this.open]) {
       const tok = this.toks.get(pos.key), p = tok?.pair;
-      const stale = !tok || now - tok.lastSeen > 10 * 60_000;
+      const stale = !tok || now - tok.lastSeen > 20 * 60_000;
       let reason = '', proceeds = 0;
       if (p && !stale) {
         const price = num(p.priceUsd), liq = num(p.liquidity?.usd);
@@ -191,7 +210,7 @@ export class Radar {
   private scan() {
     const now = Date.now(), counts: Record<string, number> = {}, picks: { tok: Tok; score: number }[] = [];
     for (const tok of this.toks.values()) {
-      if (!tok.pair) continue;
+      if (!tok.pair || now - tok.lastSeen > 90_000) continue;
       const ev = evaluate(tok.pair, now);
       tok.eval = ev;
       if (!ev.ok) { counts[ev.reject!] = (counts[ev.reject!] ?? 0) + 1; continue; }
