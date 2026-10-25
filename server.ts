@@ -7,6 +7,7 @@ import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
 import pg from 'pg';
 import { Radar } from './radar.js';
+import { Executor } from './executor.js';
 
 // ---------- types ----------
 interface Candle { t: number; o: number; h: number; l: number; c: number; v: number }
@@ -22,6 +23,7 @@ interface SymbolSnapshot {
   candles: number;
   stale: boolean;
 }
+interface Snapshot { type: 'snapshot'; ts: number; connected: boolean; symbols: SymbolSnapshot[] }
 
 // ---------- signals ----------
 
@@ -224,7 +226,7 @@ interface TradePlan {
   evidence: { signal: string; value: number; note: string }[];
 }
 interface RiskDecision { approved: boolean; qty: number; notional: number; reasons: string[]; skipped?: boolean }
-interface Decision { ts: number; plan: TradePlan; risk: RiskDecision }
+interface Decision { ts: number; plan: TradePlan; risk: RiskDecision; exec?: string }
 
 // ---------- config ----------
 const PORT = Number(process.env.PORT ?? 3000);
@@ -261,6 +263,48 @@ function record(type: string, payload: unknown) {
 
 const radar = new Radar(record);
 if (process.env.RADAR_ENABLED !== 'false') radar.start();
+const executor = new Executor(record);
+executor.start();
+
+// ---------- human gate ----------
+const HUMAN_TIMEOUT = Number(process.env.HUMAN_TIMEOUT_S ?? 60) * 1000;
+let gateMode: 'ask' | 'auto' = 'ask';
+const pending = new Map<string, { dec: Decision; expires: number }>();
+
+async function run(dec: Decision) {
+  dec.exec = 'Placing testnet order...';
+  const res = await executor.execute(dec.plan, dec.risk.qty);
+  dec.exec = res.message;
+  record('execution', { planId: dec.plan.planId, ...res });
+}
+function route(dec: Decision) {
+  const { plan } = dec;
+  if (plan.action !== 'long') { dec.exec = 'Not executed: spot cannot short'; return; }
+  if (!executor.enabled) { dec.exec = 'Not executed: no testnet keys, plan recorded only'; return; }
+  if (gateMode === 'auto') { void run(dec); return; }
+  dec.exec = 'Waiting for your approval';
+  pending.set(plan.planId, { dec, expires: Date.now() + HUMAN_TIMEOUT });
+  record('human_request', { planId: plan.planId });
+  setTimeout(() => {
+    if (pending.delete(plan.planId)) {
+      dec.exec = 'Rejected: approval timed out';
+      record('human_response', { planId: plan.planId, approved: false, timeout: true });
+    }
+  }, HUMAN_TIMEOUT);
+}
+function resolvePending(planId: string, approve: boolean) {
+  const p = pending.get(planId);
+  if (!p) return;
+  pending.delete(planId);
+  record('human_response', { planId, approved: approve });
+  if (!approve) { p.dec.exec = 'Rejected by you'; return; }
+  if (killSwitch) { p.dec.exec = 'Not executed: kill switch is on'; return; }
+  void run(p.dec);
+}
+const pendingList = () => [...pending.values()].map(({ dec, expires }) => ({
+  planId: dec.plan.planId, symbol: dec.plan.symbol, entry: dec.plan.entry, stop: dec.plan.stop, target: dec.plan.target,
+  qty: dec.risk.qty, notional: dec.risk.notional, thesis: dec.plan.thesis, secondsLeft: Math.max(0, Math.round((expires - Date.now()) / 1000)),
+}));
 
 // ---------- watcher, analyst (rules), risk ----------
 let killSwitch = false;
@@ -415,7 +459,10 @@ function risk(plan: TradePlan, st: SymbolState): RiskDecision {
   else if ((ba[0] - bb[0]) / ((ba[0] + bb[0]) / 2) > 0.001) veto.push('spread wider than 0.1%');
   const hourAgo = Date.now() - 3_600_000;
   while (approvals.length && (approvals[0] as number) < hourAgo) approvals.shift();
-  if (approvals.length >= MAX_APPROVALS_PER_HOUR) veto.push('max 3 approvals per hour reached');
+  if (executor.enabled) {
+    if (executor.positions.length >= 3) veto.push('max 3 open positions');
+    if (executor.realizedToday() < -EQUITY * 0.02) veto.push('daily loss limit (2%) reached');
+  } else if (approvals.length >= MAX_APPROVALS_PER_HOUR) veto.push('max 3 approvals per hour reached');
   let qty = (EQUITY * RISK_PER_TRADE) / dist;
   let notional = qty * plan.entry;
   if (notional > EQUITY * MAX_NOTIONAL) {
@@ -438,9 +485,11 @@ async function handle(symbol: string, st: SymbolState, sig: Signals, comp: numbe
     ? { approved: false, qty: 0, notional: 0, skipped: true, reasons: ['Analyst chose no trade'] }
     : risk(plan, st);
   record('risk_decision', { planId: plan.planId, ...rd });
-  decisions.unshift({ ts: now, plan, risk: rd });
+  const dec: Decision = { ts: now, plan, risk: rd };
+  decisions.unshift(dec);
   if (decisions.length > 30) decisions.pop();
   console.log(`${symbol} ${plan.action} -> ${rd.approved ? 'APPROVED' : (rd.skipped ? 'NO TRADE' : 'VETOED: ' + rd.reasons.join('; '))}`);
+  if (rd.approved) route(dec);
 }
 
 function watch() {
@@ -496,6 +545,9 @@ wss.on('connection', (ws: WebSocket) => {
   ws.on('message', (raw) => {
     try {
       const m = JSON.parse(raw.toString());
+      if (m.type === 'approve' || m.type === 'reject') resolvePending(String(m.planId), m.type === 'approve');
+      else if (m.type === 'set_mode' && (m.mode === 'ask' || m.mode === 'auto')) { gateMode = m.mode; record('gate_mode', { mode: gateMode }); }
+      else if (m.type === 'flatten') void executor.flatten();
       if (m.type === 'kill' || m.type === 'resume') {
         killSwitch = m.type === 'kill';
         radar.paused = killSwitch;
@@ -516,7 +568,7 @@ function snapshot() {
       candles: st.candles.length, stale: !feed.connected || now - st.lastTradeAt > 15_000,
     };
   });
-  return { type: 'snapshot', ts: now, connected: feed.connected, symbols, killSwitch, db: dbOk, equity: EQUITY, analyst: API_KEY ? 'claude' : 'rules', analystError, radar: radar.snapshot(), decisions: decisions.slice(0, 15) };
+  return { type: 'snapshot', ts: now, connected: feed.connected, symbols, killSwitch, db: dbOk, equity: EQUITY, analyst: API_KEY ? 'claude' : 'rules', analystError, radar: radar.snapshot(), executor: executor.snapshot(), gateMode, pending: pendingList(), decisions: decisions.slice(0, 15) };
 }
 
 setInterval(() => {

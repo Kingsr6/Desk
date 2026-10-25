@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Desk: majors and radar</title>
+<title>Desk: majors, radar and testnet</title>
 <style>
 :root{--bg:#eef0ec;--panel:#fbfbf8;--ink:#17201f;--mute:#667370;--line:#d3d8d2;--up:#0f8f7e;--dn:#c8503c;--amber:#b87a0a}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1517;--panel:#162023;--ink:#e6ece9;--mute:#8a9b97;--line:#27363a;--up:#3ccfb7;--dn:#f0715a;--amber:#f0b24a}}
@@ -35,7 +35,7 @@ p.note{margin:0;color:var(--mute);font-size:12.5px}
 </head>
 <body>
 <header>
-  <h1>Desk: majors and radar</h1>
+  <h1>Desk: majors, radar and testnet</h1>
   <div class="badges">
     <span class="b"><i class="dot" id="d1"></i><span id="t1">Feed</span></span>
     <span class="b"><i class="dot" id="d2"></i><span id="t2">Event store</span></span>
@@ -45,10 +45,21 @@ p.note{margin:0;color:var(--mute);font-size:12.5px}
   </div>
 </header>
 <main>
+  <section id="gate" style="display:none;border-color:var(--amber)"><h2>Waiting for your approval</h2><div id="pend"></div></section>
   <section><h2>Signals</h2><table id="t"><tr><td class="sub">Waiting for data…</td></tr></table></section>
   <section>
     <h2>Plans and risk decisions</h2>
     <div id="dec"><p class="note">Nothing yet. The Watcher flags a symbol when its composite score passes 0.28 either way, so this can take a while in quiet markets.</p></div>
+  </section>
+  <section>
+    <h2>Testnet executor <span class="sub">(Binance spot testnet, fake money)</span></h2>
+    <p class="note" id="xs">Waiting…</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0">
+      <select id="gm" style="font:inherit;padding:7px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink)"><option value="ask">Ask me before each order</option><option value="auto">Auto-place testnet orders</option></select>
+      <button id="fl" class="kill">Flatten all</button>
+    </div>
+    <div id="xp"></div><h2 style="margin-top:12px">Closed testnet trades</h2><div id="xc"></div>
+    <p class="note" style="margin-top:12px">Spot cannot short, so only long plans are placed. Each entry gets a stop and target on the exchange at once. Testnet fills are not real market fills.</p>
   </section>
   <section>
     <h2>Degen radar <span class="sub">(paper only, fake money)</span></h2>
@@ -83,12 +94,24 @@ function renderRadar(r){
   const rej=Object.entries(r.rejects).sort((a,b)=>b[1]-a[1]);
   $('rr').innerHTML=tbl(['Reason','Tokens'],rej.map(([k,v])=>[k,v]));
 }
+function renderExec(m){
+  const x=m.executor;
+  $('xs').innerHTML=x.enabled?`Connected to ${x.venue} · realized today <b class="mono">${usd(x.realizedToday)}</b> · total <b class="mono">${usd(x.total)}</b>${x.error?`<br><span style="color:var(--amber)">Last issue: ${x.error}</span>`:''}`:'Executor is off. Add BINANCE_TESTNET_KEY and BINANCE_TESTNET_SECRET in Render to enable testnet orders. Plans are still recorded.';
+  $('xp').innerHTML=tbl(['Symbol','Qty','Entry','Stop','Target','Held'],x.positions.map(p=>[`<b>${p.symbol}</b>`,p.qty,fmt(p.entry),fmt(p.stop),fmt(p.target),Math.round(p.heldMin)+'m']));
+  $('xc').innerHTML=tbl(['Symbol','Result','P&L'],x.closed.map(c=>[`<b>${c.symbol}</b>`,c.reason,`<span class="${c.pnl>=0?'up':'dn'}">${usd(c.pnl)}</span>`]));
+  if(document.activeElement!==$('gm'))$('gm').value=m.gateMode;
+  $('gate').style.display=m.pending.length?'block':'none';
+  $('pend').innerHTML=m.pending.map(p=>`<div style="margin-bottom:10px"><b>${p.symbol} LONG</b> <span class="sub mono">${p.secondsLeft}s left</span><br><span class="sub">${p.thesis}</span><br><span class="mono">Entry ${fmt(p.entry)}, stop ${fmt(p.stop)}, target ${fmt(p.target)}, size ${p.qty.toFixed(5)} (${p.notional.toFixed(0)} USDT)</span><div style="display:flex;gap:8px;margin-top:6px"><button data-a="approve" data-id="${p.planId}" class="resume" style="flex:1">Approve</button><button data-a="reject" data-id="${p.planId}" class="kill" style="flex:1">Reject</button></div></div>`).join('');
+}
+$('pend').onclick=e=>{const b=e.target.closest('button');if(b)send({type:b.dataset.a,planId:b.dataset.id})};
+$('gm').onchange=e=>send({type:'set_mode',mode:e.target.value});
+$('fl').onclick=()=>{if(confirm('Cancel protective orders and sell all testnet positions at market?'))send({type:'flatten'})};
 function connect(){
   ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws${location.search}`);
   ws.onopen=()=>{retry=0};
   ws.onmessage=e=>{
     const m=JSON.parse(e.data);if(m.type!=='snapshot')return;
-    kill=m.killSwitch;if(m.radar)renderRadar(m.radar);
+    kill=m.killSwitch;if(m.radar)renderRadar(m.radar);if(m.executor)renderExec(m);
     $('d1').className='dot'+(m.connected?' on':'');$('t1').textContent=m.connected?'Feed live':'Feed down';
     $('d2').className='dot'+(m.db?' on':'');$('t2').textContent=m.db?'Event store on':'Memory only';
     $('d3').className='dot'+(m.analyst==='claude'?' on':'');$('t3').textContent=m.analyst==='claude'?'Claude analyst':'Rules analyst (no API key)';$('err').textContent=m.analystError?('Analyst issue: '+m.analystError):'';
@@ -102,6 +125,7 @@ function connect(){
       ${p.action!=='no_trade'?`<li class="mono">Entry ${fmt(p.entry)}, stop ${fmt(p.stop)}, target ${fmt(p.target)}</li>`:''}
       ${r.approved?`<li class="mono">Size ${r.qty.toFixed(r.qty<10?4:1)} units, notional ${r.notional.toFixed(2)} USDT</li>`:''}
       <li><b>Risk:</b> ${r.reasons.join('; ')}</li>
+      ${d.exec?`<li><b>Execution:</b> ${d.exec}</li>`:''}
       ${p.evidence.map(x=>`<li class="mono">${x.signal} ${x.value>=0?'+':''}${x.value.toFixed(2)}: ${x.note}</li>`).join('')}
       <li>${p.invalidation}. Analyst: ${p.analyst}</li></ul></details>`}).join('');
   };
