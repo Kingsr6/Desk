@@ -452,7 +452,7 @@ function risk(plan: TradePlan, st: SymbolState): RiskDecision {
   if (!st.price || Math.abs(st.price - plan.entry) / plan.entry > 0.003) veto.push('plan price is stale (moved over 0.3%)');
   const dist = Math.abs(plan.entry - plan.stop);
   const stopPct = dist / plan.entry;
-  if (stopPct < 0.005 || stopPct > 0.08) veto.push('stop distance outside 0.5% to 8%');
+  if (stopPct < 0.005 - 1e-6 || stopPct > 0.08 + 1e-6) veto.push(`stop distance ${(stopPct * 100).toFixed(2)}% is outside 0.5% to 8%`);
   if (Math.abs(plan.target - plan.entry) / dist < 1.5) veto.push('reward to risk below 1.5');
   const bb = st.book.bids[0], ba = st.book.asks[0];
   if (!bb || !ba) veto.push('order book empty');
