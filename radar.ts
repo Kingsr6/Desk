@@ -95,7 +95,7 @@ export class Radar {
   start() {
     const loop = async () => {
       try { await this.cycle(); } catch (e) { this.lastError = (e as Error).message; console.error('radar:', this.lastError); }
-      setTimeout(loop, 15_000);
+      setTimeout(loop, 30_000);
     };
     void loop();
   }
@@ -103,7 +103,7 @@ export class Radar {
   async cycle() {
     if (Date.now() < this.pausedUntil) return;
     this.tick++;
-    if (this.tick % 4 === 1) await this.discover();
+    if (this.tick % 10 === 1) await this.discover();
     await this.refresh();
     this.manage();
     this.scan();
@@ -152,7 +152,7 @@ export class Radar {
     const all = [...byAddr.values()];
     const pri = all.filter((t) => held.has(t.key)).map((t) => t.address);
     const rest = all.filter((t) => !held.has(t.key)).map((t) => t.address);
-    const slots = Math.max(0, 120 - pri.length);
+    const slots = Math.max(0, 60 - pri.length);
     const pick: string[] = [];
     for (let i = 0; i < Math.min(slots, rest.length); i++) pick.push(rest[(this.rot + i) % rest.length]!);
     this.rot = rest.length ? (this.rot + slots) % rest.length : 0;
@@ -210,7 +210,7 @@ export class Radar {
   private scan() {
     const now = Date.now(), counts: Record<string, number> = {}, picks: { tok: Tok; score: number }[] = [];
     for (const tok of this.toks.values()) {
-      if (!tok.pair || now - tok.lastSeen > 90_000) continue;
+      if (!tok.pair || now - tok.lastSeen > 15 * 60_000) continue;
       const ev = evaluate(tok.pair, now);
       tok.eval = ev;
       if (!ev.ok) { counts[ev.reject!] = (counts[ev.reject!] ?? 0) + 1; continue; }
